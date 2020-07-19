@@ -3,7 +3,9 @@
 namespace Spatie\Permission\Traits;
 
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\DB;
 use Spatie\Permission\Contracts\Role;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Builder;
 use Spatie\Permission\PermissionRegistrar;
 use Illuminate\Database\Eloquent\Relations\MorphToMany;
@@ -45,7 +47,7 @@ trait HasRoles
             config('permission.table_names.model_has_roles'),
             config('permission.column_names.model_morph_key'),
             'role_id'
-        );
+        )->withPivot(['restricted_to_type', 'restricted_to_id']);
     }
 
     /**
@@ -136,6 +138,68 @@ trait HasRoles
     }
 
     /**
+     * Assign the given role to the model restricting by related model.
+     *
+     * @param string|\Spatie\Permission\Contracts\Role $role
+     * @param Illuminate\Database\Eloquent\Model $restrictionModel
+     *
+     * @return $this
+     */
+    public function assignRoleByRestrictedModel($role, Model $restrictionModel)
+    {
+        $roles = collect([$role])
+            ->flatten()
+            ->map(function ($role) {
+                if (empty($role)) {
+                    return false;
+                }
+
+                return $this->getStoredRole($role);
+            })
+            ->filter(function ($role) {
+                return $role instanceof Role;
+            })
+            ->each(function ($role) {
+                $this->ensureModelSharesGuard($role);
+            });
+
+        $model = $this->getModel();
+
+        if ($model->exists) {
+            $existingRolesUniqueHashes = $this->roles->map(function($role){
+                return $role->id . $role->pivot->model_id . $role->pivot->restricted_to_id;
+            })->all();
+
+            foreach ($roles as $role) {
+                $roleHash = $role->id . $model->id . $restrictionModel->id;
+
+                if(!in_array($roleHash, $existingRolesUniqueHashes)) {
+                    $this->roles()->attach($role->id, ['restricted_to_id' => $restrictionModel->id, 'restricted_to_type' => get_class($restrictionModel)]);
+                }
+            }
+
+            $model->load('roles');
+        } else {
+            $class = \get_class($model);
+
+            $class::saved(
+                function ($object) use ($roles, $model) {
+                    static $modelLastFiredOn;
+                    if ($modelLastFiredOn !== null && $modelLastFiredOn === $model) {
+                        return;
+                    }
+                    $object->roles()->sync($roles, false);
+                    $object->load('roles');
+                    $modelLastFiredOn = $object;
+                });
+        }
+
+        $this->forgetCachedPermissions();
+
+        return $this;
+    }
+
+    /**
      * Revoke the given role from the model.
      *
      * @param string|\Spatie\Permission\Contracts\Role $role
@@ -143,6 +207,39 @@ trait HasRoles
     public function removeRole($role)
     {
         $this->roles()->detach($this->getStoredRole($role));
+
+        $this->load('roles');
+
+        $this->forgetCachedPermissions();
+
+        return $this;
+    }
+
+    /**
+     * Detach the given role from model restricting by related model.
+     *
+     * @param string|\Spatie\Permission\Contracts\Role $role
+     * @param Illuminate\Database\Eloquent\Model $restrictionModel
+     *
+     * @return $this
+     */
+    public function detachRoleByRestrictedModel($role, Model $restrictionModel)
+    {
+        $role = $this->getStoredRole($role);
+
+        DB::table('model_has_roles')
+            ->where('role_id', $role->id)
+            ->where('restricted_to_id', $restrictionModel->id)
+            ->where('restricted_to_type', get_class($restrictionModel))
+            ->delete();
+        
+        // $this->roles()->where(
+        //     [
+        //         'role_id' => $role->id,
+        //         'restricted_to_id' => $restrictionModel->id,
+        //         'restricted_to_type' => get_class($restrictionModel)
+        //     ]
+        // )->detach();
 
         $this->load('roles');
 
@@ -205,6 +302,77 @@ trait HasRoles
         }
 
         return $roles->intersect($guard ? $this->roles->where('guard_name', $guard) : $this->roles)->isNotEmpty();
+    }
+
+    /**
+     * Determine if the model has (one of) the given role(s) on restircet model.
+     *
+     * @param string|int|array|\Spatie\Permission\Contracts\Role|\Illuminate\Support\Collection $roles
+     * @param string|null $guard
+     * @param Illuminate\Database\Eloquent\Model $restrictionModel
+     * @return bool
+     */
+    public function hasRoleOnRestrictedModel($roles, string $guard = null, Model $restrictionModel): bool
+    {
+        $restrictedModelPivotConditions = [
+            'pivot.restricted_to_id' => $restrictionModel->id,
+            'pivot.restricted_to_type' => get_class($restrictionModel)
+        ];
+
+        if (is_string($roles) && false !== strpos($roles, '|')) {
+            $roles = $this->convertPipeToArray($roles);
+        }
+
+        if (is_string($roles)) {
+            return $guard
+                ? $this->roles->where([
+                    'guard_name' => $guard,
+                    'name' => $roles
+                ] + $restrictedModelPivotConditions)
+                ->isNotEmpty()
+                : $this->roles->where([
+                    'name' => $roles
+                ] + $restrictedModelPivotConditions)
+                ->isNotEmpty();
+        }
+
+        if (is_int($roles)) {
+            return $guard
+            ? $this->roles->where([
+                'guard_name' => $guard,
+                'id' => $roles
+            ] + $restrictedModelPivotConditions)
+            ->isNotEmpty()
+            : $this->roles->where([
+                'id' => $roles
+            ] + $restrictedModelPivotConditions)
+            ->isNotEmpty();
+        }
+
+        if ($roles instanceof Role) {
+            return $this->roles
+                ->where('id', $roles->id)
+                ->where('pivot.restricted_to_id', $restrictionModel->id)
+                ->where('pivot.restricted_to_type', get_class($restrictionModel))
+                ->isNotEmpty();
+        }
+
+        if (is_array($roles)) {
+            foreach ($roles as $role) {
+                if ($this->hasRoleOnRestrictedModel($role, $guard, $restrictionModel)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        return $roles->intersect(
+            $guard ?
+            $this->roles->where([
+                'guard_name' => $guard
+            ] + $restrictedModelPivotConditions): 
+            $this->roles)->isNotEmpty();
     }
 
     /**

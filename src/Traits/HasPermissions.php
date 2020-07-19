@@ -4,6 +4,7 @@ namespace Spatie\Permission\Traits;
 
 use Spatie\Permission\Guard;
 use Illuminate\Support\Collection;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Builder;
 use Spatie\Permission\WildcardPermission;
 use Spatie\Permission\PermissionRegistrar;
@@ -244,6 +245,44 @@ trait HasPermissions
         }
 
         return true;
+    }
+
+    /**
+     * Determine if the model has, via roles, the given permission.
+     *
+     * @param \Spatie\Permission\Contracts\Permission $permission
+     * @param string|null $guardName
+     * @param Illuminate\Database\Eloquent\Model $restrictionModel
+     *
+     * @return bool
+     */
+    public function hasPermissionOnModelTo($permission, $guardName = null, Model $restrictionModel): bool
+    {
+        if (config('permission.enable_wildcard_permission', false)) {
+            return $this->hasWildcardPermission($permission, $guardName);
+        }
+
+        $permissionClass = $this->getPermissionClass();
+
+        if (is_string($permission)) {
+            $permission = $permissionClass->findByName(
+                $permission,
+                $guardName ?? $this->getDefaultGuardName()
+            );
+        }
+
+        if (is_int($permission)) {
+            $permission = $permissionClass->findById(
+                $permission,
+                $guardName ?? $this->getDefaultGuardName()
+            );
+        }
+
+        if (! $permission instanceof Permission) {
+            throw new PermissionDoesNotExist;
+        }
+
+        return $this->hasDirectPermission($permission) || $this->hasRoleOnRestrictedModel($permission->roles->all(), $guardName, $restrictionModel);
     }
 
     /**
