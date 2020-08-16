@@ -228,6 +228,8 @@ trait HasRoles
         $role = $this->getStoredRole($role);
 
         DB::table('model_has_roles')
+            ->where('model_id', $this->id)
+            ->where('model_type', get_class($this))
             ->where('role_id', $role->id)
             ->where('restricted_to_id', $restrictionModel->id)
             ->where('restricted_to_type', get_class($restrictionModel))
